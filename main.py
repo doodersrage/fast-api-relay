@@ -1,41 +1,44 @@
 import httpx
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
-import redis.asyncio as redis
-from fastapi_limiter import FastAPILimiter
+from pyrate_limiter import Duration, Limiter, Rate
 from fastapi_limiter.depends import RateLimiter
-from contextlib import asynccontextmanager
+import redis
 
 app = FastAPI()
+
+# Connect to Redis
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
 # Target API you are relaying to
 UPSTREAM_URL = "http://192.168.12.111"
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    # Connect to your Redis instance
-    redis_client = redis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
-    # Initialize the limiter
-    await FastAPILimiter.init(redis_client)
-    yield
-    # Clean up connections on shutdown
-    await redis_client.close()
+# Configuration: Allows 2 requests every 5 seconds
+route_limit = Limiter(Rate(2, Duration.SECOND * 5))
 
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/")
+@app.get("/", dependencies=[Depends(RateLimiter(limiter=route_limit))])
 async def get_json_relay():
-    async with httpx.AsyncClient() as client:
-        try:
-            # Forward the GET request
-            response = await client.get(UPSTREAM_URL)
-            
-            # Raise exception if upstream API fails
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail="Upstream error")
+    cached_item = redis_client.get(UPSTREAM_URL)
+
+    if cached_item:
+        # Return cached response if available
+        return JSONResponse(content=cached_item.decode('utf-8'))
+    
+    else:
+        async with httpx.AsyncClient() as client:
+            try:
+                # Forward the GET request
+                response = await client.get(UPSTREAM_URL)
                 
-            # Return the JSON data directly to the client
-            return JSONResponse(content=response.json())
-            
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Relay failed: {e}")
+                # Raise exception if upstream API fails
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail="Upstream error")
+                    
+                # Cache the response in Redis for future requests
+                redis_client.setex(UPSTREAM_URL, 1300, response.json())
+                # Return the JSON data directly to the client
+                return JSONResponse(content=response.json())
+                
+            except httpx.RequestError as e:
+                raise HTTPException(status_code=500, detail=f"Relay failed: {e}")
+
